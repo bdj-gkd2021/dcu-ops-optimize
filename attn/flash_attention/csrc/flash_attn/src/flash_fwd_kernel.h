@@ -3754,9 +3754,12 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
     
     Tensor sK = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutK{});
-    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutV{});
-    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
-    Tensor sVtSplit = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransSplit{});
+    Tensor sV0 = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutV{});
+    Tensor sV1 = make_tensor(sK.data() + size(sK) + size(sV0), typename Kernel_traits::SmemLayoutV{});
+    Tensor sVt0 = make_tensor(sV0.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVt1 = make_tensor(sV1.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVtSplit0 = make_tensor(sV0.data(), typename Kernel_traits::SmemLayoutVtransSplit{});
+    Tensor sVtSplit1 = make_tensor(sV1.data(), typename Kernel_traits::SmemLayoutVtransSplit{});
 
     typename Kernel_traits::TiledMma16x64  tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
@@ -3764,7 +3767,8 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
     auto thr_mma_for_gemm1 = tiled_mma_for_gemm1.get_thread_slice(tidx);
     Tensor tGrQ  = thr_mma.partition_fragment_A(gQ);                           // (MMA,MMA_M,MMA_K)
     Tensor tSrK  = thr_mma.partition_fragment_B(gK);                           // (MMA,MMA_N,MMA_K)
-    Tensor tOrVt = thr_mma_for_gemm1.partition_fragment_B(sVt);                // (MMA, MMA_K,MMA_N)
+    Tensor tOrVt0 = thr_mma_for_gemm1.partition_fragment_B(sVt0);              // (MMA, MMA_K,MMA_N)
+    Tensor tOrVt1 = thr_mma_for_gemm1.partition_fragment_B(sVt1);              // (MMA, MMA_K,MMA_N)
 
     Tensor tSgS  = thr_mma.partition_C(gP);
 
@@ -3783,8 +3787,10 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
 
     auto smem_tiled_copy_V = make_tiled_copy_B(Copy_Atom<GFX928_DS_READ_DS_M32x16_B16, Element>{}, tiled_mma_for_gemm1);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
-    Tensor tOsVt8x64 = smem_thr_copy_V.partition_S(sVtSplit);
-    Tensor tOsVt = make_tensor(tOsVt8x64.data(), convert_layout_B_rowcol_<_16x64_64, kHeadDimV/32>(tOsVt8x64.layout()));
+    Tensor tOsVt8x64_0 = smem_thr_copy_V.partition_S(sVtSplit0);
+    Tensor tOsVt8x64_1 = smem_thr_copy_V.partition_S(sVtSplit1);
+    Tensor tOsVt0 = make_tensor(tOsVt8x64_0.data(), convert_layout_B_rowcol_<_16x64_64, kHeadDimV/32>(tOsVt8x64_0.layout()));
+    Tensor tOsVt1 = make_tensor(tOsVt8x64_1.data(), convert_layout_B_rowcol_<_16x64_64, kHeadDimV/32>(tOsVt8x64_1.layout()));
 
 
     //
@@ -3824,7 +3830,7 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
     
     constexpr int k0_loops = size<2>(tSsK);
-    constexpr int k1_loops = size<2>(tOsVt);
+    constexpr int k1_loops = size<2>(tOsVt0);
     static_assert(k0_loops == 2 && k1_loops == 4);
     #pragma unroll
     for (int i = 0; i < k0_loops; ++i) {
@@ -3832,8 +3838,18 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
     }
     #pragma unroll
     for (int i = 0; i < k1_loops; ++i) {
-        lds_direct_copy<Is_even_K, Is_even_MN, _16x64_64>(gV, sV, i, params.v_row_stride, params.d, binfo.actual_seqlen_k - n_block * kBlockN);
+        lds_direct_copy<Is_even_K, Is_even_MN, _16x64_64>(gV, sV0, i, params.v_row_stride, params.d, binfo.actual_seqlen_k - n_block * kBlockN);
     }
+
+    bool use_v0 = true;
+
+#define FLASH_DIM64_PREFETCH_V(BUF, G)                                                                    \
+    do {                                                                                                  \
+        lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(G, BUF, 0, params.v_row_stride, params.d); \
+        lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(G, BUF, 1, params.v_row_stride, params.d); \
+        lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(G, BUF, 2, params.v_row_stride, params.d); \
+        lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(G, BUF, 3, params.v_row_stride, params.d); \
+    } while (0)
 
 #if 1
     #pragma unroll
@@ -3872,6 +3888,24 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = flash::convert_type<Element>(acc_s);
+
+        if (n_block > n_block_min) {
+            // Pull the next K tile forward so its latency overlaps the current softmax/dropout and V compute.
+            gK.data() = gK.data() + (-int(kBlockN * params.k_row_stride));
+            lds_direct_copy<Is_even_K>(gK, sK, 0, params.k_row_stride, params.d);
+            lds_direct_copy<Is_even_K>(gK, sK, 1, params.k_row_stride, params.d);
+        }
+
+        if (n_block > n_block_min) {
+            Tensor gV_next = gV;
+            gV_next.data() = gV_next.data() + (-int(kBlockN * params.v_row_stride));
+            if (use_v0) {
+                FLASH_DIM64_PREFETCH_V(sV1, gV_next);
+            } else {
+                FLASH_DIM64_PREFETCH_V(sV0, gV_next);
+            }
+            gV = gV_next;
+        }
 
         {   // dropout
             const int wave_id = (tidx >> 6);
@@ -3912,6 +3946,8 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
             }
         }
 
+        Tensor tOrVt = use_v0 ? tOrVt0 : tOrVt1;
+        Tensor tOsVt = use_v0 ? tOsVt0 : tOsVt1;
         asm volatile("s_waitcnt vmcnt(3) \n s_barrier");
         flash::gemm_k_rs_ds_read_m32x16_alt<0>(acc_o, rP, tOrVt, tOsVt, tiled_mma_for_gemm1, smem_tiled_copy_V, smem_thr_copy_V);
         asm volatile("s_waitcnt vmcnt(2) \n s_barrier");
@@ -3922,21 +3958,7 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
         flash::gemm_k_rs_ds_read_m32x16_alt<3>(acc_o, rP, tOrVt, tOsVt, tiled_mma_for_gemm1, smem_tiled_copy_V, smem_thr_copy_V);
         S_BARRIER;
 
-        
-        if (n_block > n_block_min) {
-            gK.data() = gK.data() + (-int(kBlockN * params.k_row_stride));
-            gV.data() = gV.data() + (-int(kBlockN * params.v_row_stride));
-
-            lds_direct_copy<Is_even_K>(gK, sK, 0, params.k_row_stride, params.d);
-            lds_direct_copy<Is_even_K>(gK, sK, 1, params.k_row_stride, params.d);
-            
-
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 0, params.v_row_stride, params.d);
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 1, params.v_row_stride, params.d);
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 2, params.v_row_stride, params.d);
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 3, params.v_row_stride, params.d);
-
-        }
+        use_v0 = !use_v0;
 
         if (n_masking_steps > 1 && n_block <= n_block_min) {
             --n_block;
@@ -3980,6 +4002,23 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
 
         Tensor rP = flash::convert_type<Element>(acc_s);
 
+        if (n_block > n_block_min) {
+            gK.data() = gK.data() + (-int(kBlockN * params.k_row_stride));
+            lds_direct_copy<Is_even_K>(gK, sK, 0, params.k_row_stride, params.d);
+            lds_direct_copy<Is_even_K>(gK, sK, 1, params.k_row_stride, params.d);
+        }
+
+        if (n_block > n_block_min) {
+            Tensor gV_next = gV;
+            gV_next.data() = gV_next.data() + (-int(kBlockN * params.v_row_stride));
+            if (use_v0) {
+                FLASH_DIM64_PREFETCH_V(sV1, gV_next);
+            } else {
+                FLASH_DIM64_PREFETCH_V(sV0, gV_next);
+            }
+            gV = gV_next;
+        }
+
         {   // dropout
             const int wave_id = (tidx >> 6);
             const int wave_id_to_row_block_id = wave_id;
@@ -4018,6 +4057,8 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
             }
         }
 
+        Tensor tOrVt = use_v0 ? tOrVt0 : tOrVt1;
+        Tensor tOsVt = use_v0 ? tOsVt0 : tOsVt1;
         asm volatile("s_waitcnt vmcnt(3) \n s_barrier");
         flash::gemm_k_rs_ds_read_m32x16_alt<0>(acc_o, rP, tOrVt, tOsVt, tiled_mma_for_gemm1, smem_tiled_copy_V, smem_thr_copy_V);
         asm volatile("s_waitcnt vmcnt(2) \n s_barrier");
@@ -4028,22 +4069,10 @@ inline __device__ void compute_attn_1rowblock_16x64_dim64_prefetch(const Params 
         flash::gemm_k_rs_ds_read_m32x16_alt<3>(acc_o, rP, tOrVt, tOsVt, tiled_mma_for_gemm1, smem_tiled_copy_V, smem_thr_copy_V);
         S_BARRIER;
 
-        
-        if (n_block > n_block_min) {
-            gK.data() = gK.data() + (-int(kBlockN * params.k_row_stride));
-            gV.data() = gV.data() + (-int(kBlockN * params.v_row_stride));
-
-            lds_direct_copy<Is_even_K>(gK, sK, 0, params.k_row_stride, params.d);
-            lds_direct_copy<Is_even_K>(gK, sK, 1, params.k_row_stride, params.d);
-            
-
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 0, params.v_row_stride, params.d);
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 1, params.v_row_stride, params.d);
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 2, params.v_row_stride, params.d);
-            lds_direct_copy<Is_even_K, /*Is_even_MN=*/true, _16x64_64>(gV, sV, 3, params.v_row_stride, params.d);
-
-        }
+        use_v0 = !use_v0;
     }
+
+#undef FLASH_DIM64_PREFETCH_V
 
     // ★ Attention Sinks: conditional normalize (direct global memory load) ★
     typename decltype(softmax)::TensorT lse;
